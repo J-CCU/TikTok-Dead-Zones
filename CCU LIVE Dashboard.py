@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-CashCards LIVE Dashboard: one-file app.
-
 Double-click to open. Put your .env (TTS_APP_KEY / TTS_APP_SECRET) next to this file.
 Press Start:  1) optionally export fresh LIVE data from TikTok Shop
               2) choose which CSVs to use
