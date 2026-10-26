@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-CashCards LIVE Dashboard: one-file app.
-
 Double-click to open. Put your .env (TTS_APP_KEY / TTS_APP_SECRET) next to this file.
 Press Start:  1) optionally export fresh LIVE data from TikTok Shop
               2) choose which CSVs to use
@@ -23,6 +21,10 @@ TOKEN_FILE = HERE / "tts_tokens.json"
 API = "https://open-api.tiktokglobalshop.com"
 AUTH = "https://auth.tiktok-shops.com"
 ACCOUNT_TYPES = ["OFFICIAL_ACCOUNTS", "MARKETING_ACCOUNTS"]
+SERVICE_ID = "7684190387405899534"          # KPI Dashboard app (override with TTS_SERVICE_ID in .env)
+WORKERS = 6                                   # LIVEs fetched in parallel
+CALLBACK_PORT = 8765                          # redirect URL: http://localhost:8765/callback
+ENV_PATH = None                               # set by load_env(); the TikTok login is stored in this .env
 
 
 class AppError(Exception):
@@ -39,16 +41,39 @@ def find_env():
     return p if p.exists() else None
 
 
-def load_env(path):
+def env_vals(path):
     vals = {}
     for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
             vals[k.strip()] = v.strip().strip('"\'')
+    return vals
+
+
+def load_env(path):
+    global ENV_PATH
+    vals = env_vals(path)
     key, secret = vals.get("TTS_APP_KEY"), vals.get("TTS_APP_SECRET")
     if not key or not secret:
         raise AppError(f"{path} must contain TTS_APP_KEY=... and TTS_APP_SECRET=...")
+    ENV_PATH = Path(path)
     return key, secret
+
+
+def update_env(path, updates, header="# TikTok Shop login (filled in automatically; anyone with this file can pull shop data)"):
+    """Set/replace KEY=value lines in the .env, keeping everything else as is."""
+    lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    done = set()
+    for i, line in enumerate(lines):
+        k = line.split("=", 1)[0].strip() if "=" in line and not line.strip().startswith("#") else None
+        if k in updates:
+            lines[i] = f"{k}={updates[k]}"; done.add(k)
+    missing = [k for k in updates if k not in done]
+    if missing:
+        if header not in lines:
+            lines += ["", header]
+        lines += [f"{k}={updates[k]}" for k in missing]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ================================================================= http ====
@@ -75,10 +100,42 @@ def http_get_json(url, params, headers=None, retries=5):
 
 
 # =============================================================== tokens ====
+TOKEN_ENV = {"access_token": "TTS_ACCESS_TOKEN", "access_token_expire_in": "TTS_ACCESS_TOKEN_EXPIRES",
+             "refresh_token": "TTS_REFRESH_TOKEN", "refresh_token_expire_in": "TTS_REFRESH_TOKEN_EXPIRES"}
+
+
 def _save_tokens(d):
-    d["saved_at"] = int(time.time())
-    TOKEN_FILE.write_text(json.dumps(d, indent=2))
+    """Store the login inside the .env so whoever has the .env is signed in."""
+    if ENV_PATH:
+        update_env(ENV_PATH, {v: d.get(k, "") for k, v in TOKEN_ENV.items()})
+    else:
+        TOKEN_FILE.write_text(json.dumps(d, indent=2))
     return d
+
+
+def load_tokens():
+    """Login from the .env; otherwise adopt an older tts_tokens.json (and copy it into the .env)."""
+    if ENV_PATH and ENV_PATH.exists():
+        v = env_vals(ENV_PATH)
+        if v.get("TTS_REFRESH_TOKEN"):
+            tok = {k: v.get(e, "") for k, e in TOKEN_ENV.items()}
+            for k in ("access_token_expire_in", "refresh_token_expire_in"):
+                tok[k] = int(tok[k]) if str(tok[k]).isdigit() else 0
+            return tok
+    places = [TOKEN_FILE, HERE.parent / "tts_tokens.json", Path.home() / "Downloads" / "tts_tokens.json",
+              Path.home() / "OneDrive" / "Downloads" / "tts_tokens.json"]
+    if ENV_PATH:
+        places.insert(0, ENV_PATH.parent / "tts_tokens.json")
+    for p in places:
+        try:
+            if p.exists():
+                tok = json.loads(p.read_text())
+                if tok.get("refresh_token"):
+                    _save_tokens(tok)
+                    return tok
+        except (OSError, ValueError):
+            pass
+    return None
 
 
 def _token_call(path, params):
@@ -93,9 +150,9 @@ def get_access_token(key, secret, auth_code=None):
         d = _token_call("/api/v2/token/get", {"app_key": key, "app_secret": secret,
                                               "auth_code": auth_code.strip(), "grant_type": "authorized_code"})
         return _save_tokens(d)["access_token"]
-    if not TOKEN_FILE.exists():
-        raise NeedAuthCode("No saved login yet.")
-    tok = json.loads(TOKEN_FILE.read_text())
+    tok = load_tokens()
+    if not tok:
+        raise NeedAuthCode("This .env doesn't have a TikTok Shop login yet.")
     if tok.get("access_token_expire_in", 0) - time.time() < 3600:
         if tok.get("refresh_token_expire_in", 0) and tok["refresh_token_expire_in"] < time.time():
             raise NeedAuthCode("Saved login has expired.")
@@ -106,6 +163,48 @@ def get_access_token(key, secret, auth_code=None):
         except AppError as e:
             raise NeedAuthCode(f"Couldn't refresh login ({e}).")
     return tok["access_token"]
+
+
+def extract_code(text):
+    """Accept a bare code or a whole pasted URL containing code=..."""
+    text = (text or "").strip()
+    if "code=" in text:
+        q = urllib.parse.urlparse(text).query or text.split("?", 1)[-1]
+        return urllib.parse.parse_qs(q).get("code", [""])[0]
+    return text
+
+
+def browser_authorize(service_id, timeout=240):
+    """Open TikTok's approval page and catch the code on http://localhost:8765/callback."""
+    import http.server
+    got = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" in qs:
+                got["code"] = qs["code"][0]
+            msg = ("<h2>Connected. You can close this tab and go back to the app.</h2>" if "code" in qs
+                   else "<h2>No code received.</h2><p>Go back to the app and try again.</p>")
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
+            self.wfile.write(f"<html><body style='font-family:sans-serif;padding:40px'>{msg}</body></html>".encode())
+
+    try:
+        srv = http.server.HTTPServer(("127.0.0.1", CALLBACK_PORT), H)
+    except OSError:
+        raise AppError(f"Port {CALLBACK_PORT} is busy; close other copies of the app and retry.")
+    srv.timeout = 1
+    webbrowser.open(f"https://services.us.tiktokshop.com/open/authorize?service_id={service_id}")
+    end = time.time() + timeout
+    try:
+        while "code" not in got and time.time() < end:
+            srv.handle_request()
+    finally:
+        srv.server_close()
+    return got.get("code")
 
 
 # ============================================================== signing ====
@@ -121,11 +220,19 @@ class Client:
 
     def get(self, path, **params):
         params = {k: v for k, v in params.items() if v is not None}
-        params.update(app_key=self.key, timestamp=int(time.time()))
+        params.update(app_key=self.key)
         if self.shop_cipher:
             params.setdefault("shop_cipher", self.shop_cipher)
-        params["sign"] = sign(path, params, self.secret)
-        body = http_get_json(API + path, params, {"x-tts-access-token": self.token, "content-type": "application/json"})
+        for attempt in range(6):
+            params["timestamp"] = int(time.time())
+            params.pop("sign", None)
+            params["sign"] = sign(path, params, self.secret)
+            body = http_get_json(API + path, params, {"x-tts-access-token": self.token, "content-type": "application/json"})
+            msg = str(body.get("message", "")).lower()
+            if body.get("code") != 0 and ("limit" in msg or "too many" in msg or "frequen" in msg):
+                time.sleep(min(30, 2 ** attempt))      # rate limited: back off and retry
+                continue
+            break
         if body.get("code") != 0:
             raise AppError(f"{path}: {body.get('code')} {body.get('message')}")
         return body.get("data") or {}
@@ -187,12 +294,21 @@ def run_export(key, secret, start, end, log, auth_code=None, currency="USD"):
             if not token:
                 break
         log(f"  {acct}: data available through {d.get('latest_available_date')}")
-    log(f"Found {len(sessions)} LIVE sessions. Pulling minute data…")
+    log(f"Found {len(sessions)} LIVE sessions. Pulling minute data ({WORKERS} at a time)…")
 
-    srows, mrows = [], []
-    for i, s in enumerate(sessions, 1):
-        live_id, user = s.get("id"), (s.get("creator") or {}).get("user_name", "")
-        row = flatten(s); row["account"] = user; srows.append(row)
+    cache_dir = EXPORTS / ".cache"; cache_dir.mkdir(parents=True, exist_ok=True)
+    cutoff = (date.today() - timedelta(days=2)).isoformat()   # LIVEs older than this are final -> cacheable
+    lock = threading.Lock(); done = [0]; hits = [0]
+
+    def fetch(s):
+        live_id = s.get("id")
+        cf = cache_dir / f"{live_id}.json"
+        if cf.exists():
+            try:
+                with lock: hits[0] += 1
+                return json.loads(cf.read_text()), None, True
+            except ValueError:
+                pass
         intervals, overall, token = [], {}, None
         try:
             while True:
@@ -205,14 +321,48 @@ def run_export(key, secret, start, end, log, auth_code=None, currency="USD"):
                 if not token:
                     break
         except AppError as e:
-            log(f"  [{i}/{len(sessions)}] {user}: skipped ({str(e)[:90]}). Usually still live or not processed yet.")
+            return None, str(e), False
+        data = {"overall": overall, "intervals": intervals}
+        if intervals and str(s.get("start_time", ""))[:10] and str(s.get("start_time", ""))[:10] < cutoff:
+            cf.write_text(json.dumps(data))
+        return data, None, False
+
+    def report(s, data, err, cached):
+        user = (s.get("creator") or {}).get("user_name", "")
+        with lock:
+            done[0] += 1; n = done[0]
+        if err:
+            log(f"  [{n}/{len(sessions)}] {user}: skipped ({err[:90]}). Usually still live or not processed yet.")
+        else:
+            log(f"  [{n}/{len(sessions)}] {user:<20} {len(data['intervals'])} minutes{'  (cached)' if cached else ''}")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(fetch, s): s for s in sessions}
+        for f in as_completed(futs):
+            s = futs[f]
+            try:
+                data, err, cached = f.result()
+            except Exception as e:
+                data, err, cached = None, str(e), False
+            report(s, data, err, cached)
+            results[s.get("id")] = data
+
+    srows, mrows = [], []
+    for s in sessions:                       # keep a stable order in the CSVs
+        live_id, user = s.get("id"), (s.get("creator") or {}).get("user_name", "")
+        row = flatten(s); row["account"] = user; srows.append(row)
+        data = results.get(live_id)
+        if not data:
             continue
-        for iv in intervals:
-            r = {"account": user, "live_id": live_id, "live_title": overall.get("live_title") or s.get("title"),
+        title = (data.get("overall") or {}).get("live_title") or s.get("title")
+        for iv in data["intervals"]:
+            r = {"account": user, "live_id": live_id, "live_title": title,
                  "minute_start": ts_local(iv.get("start_time")), "minute_end": ts_local(iv.get("end_time"))}
             r.update(flatten(iv)); mrows.append(r)
-        log(f"  [{i}/{len(sessions)}] {user:<20} {len(intervals)} minutes")
-        time.sleep(0.2)
+    if hits[0]:
+        log(f"Reused {hits[0]} LIVE(s) from cache.")
 
     EXPORTS.mkdir(exist_ok=True)
     stamp = f"{start}_{end}"
@@ -298,7 +448,14 @@ def run_gui():
 
     def refresh_status():
         envvar.set(f"✔ .env: {state['env']}" if state["env"] else "✖ No .env found next to this app. Click 'Choose .env…'")
-        tokvar.set("✔ TikTok login saved" if TOKEN_FILE.exists() else "• No TikTok login saved yet (you'll be asked for an auth code on first export)")
+        has = False
+        if state["env"]:
+            try:
+                load_env(state["env"]); has = load_tokens() is not None
+            except Exception:
+                pass
+        tokvar.set("✔ TikTok Shop login found in .env (no sign-in needed)" if has
+                   else "• No TikTok Shop login in this .env yet. The first export will connect it once")
 
     def open_path(p):
         try:
@@ -355,12 +512,35 @@ def run_gui():
         threading.Thread(target=work, daemon=True).start()
 
     def ask_auth_code(key, secret, start, end, why):
+        if messagebox.askyesno(APP_NAME, f"{why}\n\nConnect it now? Your browser will open TikTok Shop. "
+                               "Sign in to the shop and click Authorize. The app picks up the rest.\n\n"
+                               "This only happens once. The login is then saved in the .env, so anyone "
+                               "using this .env is signed in automatically.\n\n"
+                               "(Choose No to paste a code manually instead.)"):
+            busy(True); log("Waiting for approval in your browser (up to 4 minutes)…")
+            sid = env_vals(state["env"]).get("TTS_SERVICE_ID") or SERVICE_ID
+
+            def work():
+                try:
+                    code = browser_authorize(sid)
+                except Exception as e:
+                    code = None; log("Browser sign-in failed: " + str(e))
+                if code:
+                    log("Approved. Saving login to .env…")
+                    q.put(("call", lambda code=code: (busy(False), start_export(key, secret, start, end, code))))
+                else:
+                    log("No approval came back to the app. If the browser landed on another page showing a code, paste it.")
+                    q.put(("call", lambda: (busy(False), paste_code(key, secret, start, end))))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            paste_code(key, secret, start, end)
+
+    def paste_code(key, secret, start, end):
         code = simpledialog.askstring(APP_NAME,
-            f"{why}\n\nGet a one-time auth code:\n"
-            "1. Partner Center → App & Service → KPI Dashboard\n"
-            "2. Authorization box: set dropdown to 'Seller', click 'Copy authorization link'\n"
-            "3. Open the link while logged into the shop, approve\n"
-            "4. Copy the 'code' value from the page you land on\n\nPaste the code:", parent=root)
+            "Paste the auth code, or the whole address of the page you landed on after approving:\n\n"
+            "(Partner Center → App & Service → KPI Dashboard → Authorization → 'Seller' → "
+            "Copy authorization link → open it → approve.)", parent=root)
+        code = extract_code(code)
         if code:
             start_export(key, secret, start, end, code)
 
