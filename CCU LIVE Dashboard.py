@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+CashCards LIVE Dashboard: one-file app.
+
 Double-click to open. Put your .env (TTS_APP_KEY / TTS_APP_SECRET) next to this file.
 Press Start:  1) optionally export fresh LIVE data from TikTok Shop
               2) choose which CSVs to use
@@ -36,9 +38,18 @@ class NeedAuthCode(AppError):
 
 
 # =============================================================== config ====
+ENV_NAMES = [".env", "env.txt", "env", "config.env", "tts.env", ".env.txt", "env.txt.txt", "config.txt"]
+
+
 def find_env():
-    p = HERE / ".env"
-    return p if p.exists() else None
+    """The settings file next to the app. Mac Finder won't create '.env', so 'env.txt' etc. also work."""
+    for n in ENV_NAMES:
+        p = HERE / n
+        if p.exists():
+            return p
+    for p in sorted(HERE.glob("*.env")):
+        return p
+    return None
 
 
 def env_vals(path):
@@ -264,6 +275,18 @@ def write_csv(path, rows, lead):
         w.writerows(rows)
 
 
+def safe_write_csv(path, rows, lead, log):
+    """Write the CSV; if it's locked (e.g. open in Excel), save under a new name instead."""
+    try:
+        write_csv(path, rows, lead)
+        return path
+    except PermissionError:
+        alt = path.with_name(f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}")
+        write_csv(alt, rows, lead)
+        log(f"  {path.name} is open in another program (Excel?), so saved as {alt.name}")
+        return alt
+
+
 def ts_local(v):
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(v)))
@@ -367,8 +390,8 @@ def run_export(key, secret, start, end, log, auth_code=None, currency="USD"):
     EXPORTS.mkdir(exist_ok=True)
     stamp = f"{start}_{end}"
     sp, mp = EXPORTS / f"live_sessions_{stamp}.csv", EXPORTS / f"live_minutes_{stamp}.csv"
-    write_csv(sp, srows, ["account", "id", "title", "start_time", "end_time"])
-    write_csv(mp, mrows, ["account", "live_id", "live_title", "minute_start", "minute_end"])
+    sp = safe_write_csv(sp, srows, ["account", "id", "title", "start_time", "end_time"], log)
+    mp = safe_write_csv(mp, mrows, ["account", "live_id", "live_title", "minute_start", "minute_end"], log)
     log(f"Saved {len(srows)} sessions and {len(mrows):,} minute rows to the exports folder.")
     return sp, mp
 
@@ -447,7 +470,7 @@ def run_gui():
         root.after(100, pump)
 
     def refresh_status():
-        envvar.set(f"✔ .env: {state['env']}" if state["env"] else "✖ No .env found next to this app. Click 'Choose .env…'")
+        envvar.set(f"✔ .env: {state['env']}" if state["env"] else "✖ No settings file found next to this app (.env or env.txt). Click 'Choose .env…'")
         has = False
         if state["env"]:
             try:
@@ -459,13 +482,18 @@ def run_gui():
 
     def open_path(p):
         try:
-            os.startfile(p)  # Windows
-        except AttributeError:
+            if sys.platform == "win32":
+                os.startfile(p)
+            elif sys.platform == "darwin":
+                import subprocess; subprocess.run(["open", str(p)])
+            else:
+                webbrowser.open(Path(p).as_uri())
+        except Exception:
             webbrowser.open(Path(p).as_uri())
 
     def pick_env():
         p = filedialog.askopenfilename(title="Choose your .env file", initialdir=str(HERE),
-                                       filetypes=[("env files", "*.env .env"), ("All files", "*.*")])
+                                       filetypes=[("Settings files", "*.env .env *.txt"), ("All files", "*.*")])
         if p:
             state["env"] = Path(p); refresh_status()
 
