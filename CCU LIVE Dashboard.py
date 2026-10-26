@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-CashCards LIVE Dashboard: one-file app.
-
 Double-click to open. Put your .env (TTS_APP_KEY / TTS_APP_SECRET) next to this file.
 Press Start:  1) optionally export fresh LIVE data from TikTok Shop
               2) choose which CSVs to use
@@ -47,9 +45,31 @@ def find_env():
         p = HERE / n
         if p.exists():
             return p
-    for p in sorted(HERE.glob("*.env")):
-        return p
+    for pat in ("*.env", "env*", "Env*", "ENV*", "config*"):
+        for p in sorted(HERE.glob(pat)):
+            if p.is_file() and p.suffix.lower() not in (".py", ".pyw", ".html", ".csv", ".json"):
+                return p
     return None
+
+
+def normalize_env(path):
+    """If the settings file is rich text (TextEdit .rtf / .rtfd) or otherwise messy, pull out the
+    KEY=value pairs and save a clean plain-text env.txt next to it. Returns the usable path."""
+    path = Path(path)
+    if path.is_dir() and (path / "TXT.rtf").exists():          # .rtfd bundle
+        raw = (path / "TXT.rtf").read_text(encoding="utf-8", errors="ignore")
+    else:
+        raw = path.read_text(encoding="utf-8-sig", errors="ignore")
+    if not raw.lstrip().startswith("{\\rtf") and path.suffix.lower() not in (".rtf", ".rtfd"):
+        return path
+    import re
+    pairs = re.findall(r"(TTS_[A-Z_]+)\s*=\s*([^\s\\}]+)", raw)
+    if not pairs:
+        raise AppError(f"Couldn't read any settings from {path.name}. In TextEdit choose Format → Make Plain Text, "
+                       "then save it again as env.txt.")
+    clean = path.with_name("env.txt")
+    clean.write_text("\n".join(f"{k}={v}" for k, v in dict(pairs).items()) + "\n", encoding="utf-8")
+    return clean
 
 
 def env_vals(path):
@@ -63,6 +83,7 @@ def env_vals(path):
 
 def load_env(path):
     global ENV_PATH
+    path = normalize_env(path)
     vals = env_vals(path)
     key, secret = vals.get("TTS_APP_KEY"), vals.get("TTS_APP_SECRET")
     if not key or not secret:
@@ -492,10 +513,16 @@ def run_gui():
             webbrowser.open(Path(p).as_uri())
 
     def pick_env():
-        p = filedialog.askopenfilename(title="Choose your .env file", initialdir=str(HERE),
-                                       filetypes=[("Settings files", "*.env .env *.txt"), ("All files", "*.*")])
+        opts = dict(title="Choose your settings file (.env / env.txt)", initialdir=str(HERE))
+        if sys.platform != "darwin":   # Mac greys out files that don't match a filter, so show everything there
+            opts["filetypes"] = [("Settings files", "*.env .env *.txt"), ("All files", "*.*")]
+        p = filedialog.askopenfilename(**opts)
         if p:
-            state["env"] = Path(p); refresh_status()
+            try:
+                state["env"] = normalize_env(p)
+            except AppError as e:
+                messagebox.showerror(APP_NAME, str(e)); return
+            refresh_status()
 
     def busy(on):
         state["busy"] = on
